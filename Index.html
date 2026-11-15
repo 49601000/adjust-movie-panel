@@ -51,7 +51,7 @@
 </head>
 <body>
   <h1>調整パネル</h1>
-  <p class="help">プロジェクト（話）を選んで読み込み、行ごとにセリフ／スライド／表情／改行／SE／タイミングを調整してください。行の分割・追加・削除もできます。「修正依頼を保存」を押すと、Drive の同じフォルダに adjust_request.json が保存されます（通常は変更分のみ、行構成を変えた場合は全行）。</p>
+  <p class="help">プロジェクト（話）を選んで読み込み、行ごとにセリフ／スライド／表情／改行／SE／タイミングを調整してください。行の分割・追加・削除もできます。「修正依頼を保存」を押すと、Drive の同じフォルダに adjust_request.json が保存されます（通常は変更分のみ、行構成を変えた場合は全行）。<span id="saveDest"></span> 共用アセットの置き場: <a href="https://drive.google.com/drive/folders/1oMc447xUEsA15rPLmABwzvCm0Inu_Kme" target="_blank" rel="noopener">調整パネル_shared-assets</a></p>
 
   <div class="projbar">
     <select id="projectSelect"><option value="">読み込み中…</option></select>
@@ -387,6 +387,12 @@ function renderAll() {
   if (current.folderName) info.push('フォルダ: ' + esc(current.folderName));
   if (m.maxChars) info.push('改行は1行 最大' + esc(m.maxChars) + '文字');
   $('epInfo').innerHTML = info.join('　');
+  var sd = $('saveDest');
+  if (sd) {
+    sd.innerHTML = current.folderId
+      ? ' 保存先フォルダ: <a href="https://drive.google.com/drive/folders/' + encodeURIComponent(current.folderId) + '" target="_blank" rel="noopener">' + esc(current.folderName || current.folderId) + '</a>（adjust_request.json はここに保存されます）'
+      : '';
+  }
 
   var maxNote = m.maxChars ? '（1行 最大' + esc(m.maxChars) + '文字）' : '';
   var html = '';
