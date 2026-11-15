@@ -17,6 +17,7 @@
   .epinfo { font-size: 13px; color: #444; margin: 6px 0 10px; }
   .summary { position: sticky; top: 0; z-index: 5; display: flex; gap: 14px; align-items: center;
              background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 8px 12px; margin-bottom: 10px; }
+  .summary[hidden] { display: none; }
   .summary b { font-size: 16px; }
   details { margin-bottom: 12px; }
   details pre { background: #f4f4f4; border: 1px solid #ddd; border-radius: 6px; padding: 10px;
@@ -29,12 +30,12 @@
   .nostill { width: 240px; height: 135px; display: flex; align-items: center; justify-content: center;
              background: #eee; color: #999; border-radius: 4px; font-size: 13px; }
   .rbody { flex: 1; min-width: 0; }
-  .head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  .head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .head .n { font-weight: bold; color: #888; }
-  .badge { padding: 1px 9px; border-radius: 10px; font-size: 12px; font-weight: bold; white-space: nowrap; }
-  .badge.z { background: #86D654; color: #173d05; }
-  .badge.m { background: #FF5CA3; color: #4d0f2c; }
-  .head .text { font-size: 15px; }
+  .head .f-sp { font-size: 13px; padding: 3px; }
+  .head .f-text { flex: 1; min-width: 140px; font-size: 15px; padding: 4px 6px; color: #222; }
+  .ops { display: flex; gap: 4px; }
+  .ops button { font-size: 12px; padding: 3px 9px; }
   .chg { color: #b26a00; font-weight: bold; font-size: 12px; }
   .controls { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
               gap: 8px 14px; margin-top: 10px; }
@@ -50,7 +51,7 @@
 </head>
 <body>
   <h1>調整パネル</h1>
-  <p class="help">プロジェクト（話）を選んで読み込み、行ごとにスライド／表情／改行／SE／タイミングを調整してください。「修正依頼を保存」を押すと、Drive の同じフォルダに adjust_request.json（変更分のみ）が保存されます。</p>
+  <p class="help">プロジェクト（話）を選んで読み込み、行ごとにセリフ／スライド／表情／改行／SE／タイミングを調整してください。行の分割・追加・削除もできます。「修正依頼を保存」を押すと、Drive の同じフォルダに adjust_request.json が保存されます（通常は変更分のみ、行構成を変えた場合は全行）。</p>
 
   <div class="projbar">
     <select id="projectSelect"><option value="">読み込み中…</option></select>
@@ -60,7 +61,7 @@
   <div id="epInfo" class="epinfo"></div>
 
   <div id="summaryBar" class="summary" hidden>
-    <span>変更: <b id="changeCount">0</b> 行</span>
+    <span id="changeSummary">変更: 0 行</span>
     <button id="saveBtn">修正依頼を保存（Drive）</button>
     <span id="saveStatus" class="status"></span>
   </div>
@@ -79,10 +80,16 @@
 var projects = [];   // listProjects の結果
 var current = null;  // { folderId, folderName, mappingFileId, mapping, cats }
 var orig = [];       // 読み込んだ対応表の行（正規化済みスナップショット）
-var state = [];      // 現在の編集状態（orig と同じ形）
+var state = [];      // 現在の編集状態（orig と同じ形＋uid）
+var origByUid = {};  // uid -> orig の行
+var origSeq = [];    // 読み込み時点の uid の並び（構成変更の判定用）
+var stillByUid = {}; // uid -> 対応表の生の行（静止画参照用）
 var stillCache = {}; // still fileId -> data URL（フォールバック用）
+var sharedCats = null; // 共用カタログ（正規化済み {expr_z, expr_m, se}。取得失敗時は null）
+var uidCounter = 0;  // 新規行の uid 連番
 
 var FIELD_LABEL = {
+  text: 'セリフ', sp: '話者',
   breaks: '改行', slide: 'スライド', expr_z: '表情Z', expr_m: '表情M',
   onset: 'onset', offset: 'offset', se: 'SE', note: 'メモ'
 };
@@ -104,6 +111,7 @@ function setStatus(id, msg, isErr) {
   el.textContent = msg || '';
   el.className = 'status' + (isErr ? ' err' : '');
 }
+function newUid_() { return 'n' + (++uidCounter); }
 
 /* ============ カタログ正規化 ============
    slides / se は {id, label}、expr はセット名の文字列配列が基本。
@@ -115,6 +123,21 @@ function catList(cat) {
     var id = x.id != null ? x.id : (x.name != null ? x.name : '');
     return { id: String(id), label: String(x.label != null ? x.label : (x.name != null ? x.name : id)) };
   });
+}
+
+/* 共用カタログと対応表カタログの和集合。
+   共用側を先に並べ、対応表側は id が重ならないものだけ後ろに足す
+   （SE の id が衝突した場合は共用側のエントリが残る）。 */
+function unionCatList(shared, mapping) {
+  var out = [];
+  var seen = {};
+  (shared || []).forEach(function (o) {
+    if (!seen[o.id]) { seen[o.id] = 1; out.push(o); }
+  });
+  (mapping || []).forEach(function (o) {
+    if (!seen[o.id]) { seen[o.id] = 1; out.push(o); }
+  });
+  return out;
 }
 
 /* 現在値がカタログに無い場合は落とさず「表に無い値」として残す */
@@ -157,11 +180,48 @@ function seOptionsHtml(list, current) {
   });
   return html;
 }
+function spOptionsHtml(current) {
+  return '<option value="Z"' + (current === 'Z' ? ' selected' : '') + '>ずんだもん</option>' +
+         '<option value="M"' + (current === 'M' ? ' selected' : '') + '>めたん</option>';
+}
+
+/* ============ 改行の強制リフロー（maxChars 超過の目視検出用） ============
+   幅は全角=1・半角=0.5 で数え（「1行 最大13文字（全角）」のルールに合わせる）、
+   1行が max を超えたら、収まる位置で強制的に改行を入れる。
+   制作側のミスも編集時の超過も、枠内で改行が増えることで目視検出できる。 */
+function charWidth_(ch) {
+  var cp = ch.codePointAt(0);
+  if (cp <= 0x7E || (cp >= 0xFF61 && cp <= 0xFF9F)) return 0.5;
+  return 1;
+}
+function reflowBreaks(text, max) {
+  max = parseInt(max, 10);
+  if (!max || max < 1) return text;
+  return String(text == null ? '' : text).split('\n').map(function (line) {
+    var out = [];
+    var cur = '';
+    var w = 0;
+    Array.from(line).forEach(function (ch) {
+      var cw = charWidth_(ch);
+      if (cur !== '' && w + cw > max) {
+        out.push(cur);
+        cur = ch;
+        w = cw;
+      } else {
+        cur += ch;
+        w += cw;
+      }
+    });
+    out.push(cur);
+    return out.join('\n');
+  }).join('\n');
+}
 
 /* ============ 行の正規化 ============ */
-function normLine(l) {
+function normLine(l, uid) {
   l = l || {};
   return {
+    uid: uid,
     n: l.n,
     sp: l.sp || '',
     text: l.text != null ? String(l.text) : '',
@@ -174,7 +234,8 @@ function normLine(l) {
     offset: toFrame(l.offset),
     seId: (l.se && l.se.id != null) ? String(l.se.id) : '',
     seFrame: l.se ? toFrame(l.se.frame) : toFrame(l.onset),
-    note: l.note != null ? String(l.note) : ''
+    note: l.note != null ? String(l.note) : '',
+    _forced: false
   };
 }
 
@@ -192,6 +253,20 @@ function init() {
       setStatus('projStatus', '一覧の取得に失敗: ' + ((e && e.message) || e), true);
     })
     .listProjects();
+  google.script.run
+    .withSuccessHandler(onSharedCatalogs)
+    .withFailureHandler(function () { sharedCats = null; })
+    .getSharedCatalogs();
+}
+
+/* 共用カタログの受信。失敗しても対応表側のカタログだけで動く（無言でフォールバック）。 */
+function onSharedCatalogs(res) {
+  if (!res || res.ok === false) { sharedCats = null; return; }
+  sharedCats = {
+    expr_z: catList(res.expr_z),
+    expr_m: catList(res.expr_m),
+    se: catList(res.se)
+  };
 }
 
 function onProjects(res) {
@@ -229,20 +304,38 @@ function onLoadProject() {
         setStatus('projStatus', '対応表の読み込みに失敗: ' + (m && m.error ? m.error : '形式が不正です'), true);
         return;
       }
+      var mapCats = {
+        slides: catList(m.catalogs && m.catalogs.slides),
+        expr_z: catList(m.catalogs && m.catalogs.expr_z),
+        expr_m: catList(m.catalogs && m.catalogs.expr_m),
+        se: catList(m.catalogs && m.catalogs.se)
+      };
       current = {
         folderId: p.folderId,
         folderName: p.folderName,
         mappingFileId: p.mappingFileId,
         mapping: m,
         cats: {
-          slides: catList(m.catalogs && m.catalogs.slides),
-          expr_z: catList(m.catalogs && m.catalogs.expr_z),
-          expr_m: catList(m.catalogs && m.catalogs.expr_m),
-          se: catList(m.catalogs && m.catalogs.se)
+          slides: mapCats.slides,
+          expr_z: sharedCats ? unionCatList(sharedCats.expr_z, mapCats.expr_z) : mapCats.expr_z,
+          expr_m: sharedCats ? unionCatList(sharedCats.expr_m, mapCats.expr_m) : mapCats.expr_m,
+          se: sharedCats ? unionCatList(sharedCats.se, mapCats.se) : mapCats.se
         }
       };
-      orig = m.lines.map(normLine);
-      state = m.lines.map(normLine);
+      uidCounter = 0;
+      orig = m.lines.map(function (l, i) { return normLine(l, 'o' + i); });
+      state = m.lines.map(function (l, i) { return normLine(l, 'o' + i); });
+      if (m.maxChars) {
+        state.forEach(function (s) {
+          var r = reflowBreaks(s.breaks, m.maxChars);
+          if (r !== s.breaks) { s.breaks = r; s._forced = true; }
+        });
+      }
+      origByUid = {};
+      orig.forEach(function (o) { origByUid[o.uid] = o; });
+      origSeq = orig.map(function (o) { return o.uid; });
+      stillByUid = {};
+      m.lines.forEach(function (l, i) { stillByUid['o' + i] = l; });
       stillCache = {};
       renderAll();
       setStatus('projStatus', '読み込みました: ' + (m.episode || p.folderName), false);
@@ -297,19 +390,22 @@ function renderAll() {
 
   var maxNote = m.maxChars ? '（1行 最大' + esc(m.maxChars) + '文字）' : '';
   var html = '';
-  m.lines.forEach(function (raw, i) {
-    var s = state[i];
-    var badge = s.sp === 'Z'
-      ? '<span class="badge z">ずんだもん</span>'
-      : '<span class="badge m">めたん</span>';
+  state.forEach(function (s, i) {
     html += '<div class="row" data-i="' + i + '" id="row' + i + '">' +
-      '<div class="still">' + stillHtml(raw) + '</div>' +
+      '<div class="still">' + stillHtml(stillByUid[s.uid]) + '</div>' +
       '<div class="rbody">' +
-        '<div class="head"><span class="n">#' + esc(s.n) + '</span>' + badge +
-          '<span class="text">' + esc(s.text) + '</span>' +
+        '<div class="head"><span class="n">#' + (i + 1) + '</span>' +
+          '<select class="f-sp">' + spOptionsHtml(s.sp) + '</select>' +
+          '<input type="text" class="f-text" value="' + esc(s.text) + '">' +
+          '<span class="ops">' +
+            '<button type="button" data-act="split">分割</button>' +
+            '<button type="button" data-act="insert">+行</button>' +
+            '<button type="button" data-act="del"' + (state.length <= 1 ? ' disabled' : '') + '>削除</button>' +
+          '</span>' +
           '<span class="chg" hidden></span></div>' +
         '<div class="controls">' +
           '<label class="wide">改行表示' + maxNote +
+            (s._forced ? ' <span style="color:#c00;font-weight:bold">⚠ ' + esc(m.maxChars) + '文字で強制改行</span>' : '') +
             '<textarea class="f-breaks" rows="3">' + esc(s.breaks) + '</textarea></label>' +
           '<label>スライド' +
             '<select class="f-slide">' + slideOptionsHtml(current.cats.slides, s.slide) + '</select></label>' +
@@ -381,6 +477,67 @@ function clampFrame(v) {
   return Math.max(0, n);
 }
 
+/* ============ 行の構成操作（分割・追加・削除） ============
+   state が唯一の正。編集内容は input/change イベントで state に入っているので、
+   操作後は renderAll() で丸ごと描き直しても何も失われない。 */
+
+/* 行 i を中点で分割する。元の行は onset 不変・offset が中点になり、SE はそのまま残る。
+   新しい行は元の行のコピー（話者・セリフ・改行・スライド・表情）で onset=中点、SE なし。 */
+function splitRow(i) {
+  var s = state[i];
+  if (!s) return;
+  var mid = Math.floor((s.onset + s.offset) / 2);
+  var oldOffset = s.offset;
+  s.offset = mid;
+  state.splice(i + 1, 0, {
+    uid: newUid_(),
+    n: null,
+    sp: s.sp,
+    text: s.text,
+    breaks: s.breaks,
+    slide: s.slide,
+    create: s.create || '',
+    expr_z: s.expr_z,
+    expr_m: s.expr_m,
+    onset: mid,
+    offset: oldOffset,
+    seId: '',
+    seFrame: mid,
+    note: ''
+  });
+  renderAll();
+}
+
+/* 行 i の後ろに空行を挿入する（話者は行 i と同じ、開始=終了=行 i の offset）。 */
+function insertRow(i) {
+  var s = state[i];
+  if (!s) return;
+  state.splice(i + 1, 0, {
+    uid: newUid_(),
+    n: null,
+    sp: s.sp,
+    text: '',
+    breaks: '',
+    slide: '',
+    create: '',
+    expr_z: '',
+    expr_m: '',
+    onset: s.offset,
+    offset: s.offset,
+    seId: '',
+    seFrame: s.offset,
+    note: ''
+  });
+  renderAll();
+}
+
+/* 行 i を削除する。残り1行のときは何もしない。 */
+function deleteRow(i) {
+  if (state.length <= 1) return;
+  state.splice(i, 1);
+  renderAll();
+}
+
 /* ============ 入力イベント（委譲） ============ */
 function rowIndexOf(el) {
   var row = el;
@@ -391,11 +548,23 @@ function rowIndexOf(el) {
 document.addEventListener('DOMContentLoaded', function () {
   var rowsEl = $('rows');
 
+  rowsEl.addEventListener('click', function (ev) {
+    var t = ev.target;
+    var act = t && t.getAttribute ? t.getAttribute('data-act') : null;
+    if (!act) return;
+    var i = rowIndexOf(t);
+    if (i < 0) return;
+    if (act === 'split') splitRow(i);
+    else if (act === 'insert') insertRow(i);
+    else if (act === 'del') deleteRow(i);
+  });
+
   rowsEl.addEventListener('input', function (ev) {
     var t = ev.target;
     var i = rowIndexOf(t);
     if (i < 0) return;
-    if (t.classList.contains('f-breaks')) { state[i].breaks = t.value; refreshChanges(); }
+    if (t.classList.contains('f-text')) { state[i].text = t.value; refreshChanges(); }
+    else if (t.classList.contains('f-breaks')) { state[i].breaks = t.value; refreshChanges(); }
     else if (t.classList.contains('f-create')) { state[i].create = t.value; refreshChanges(); }
     else if (t.classList.contains('f-note')) { state[i].note = t.value; refreshChanges(); }
   });
@@ -404,7 +573,20 @@ document.addEventListener('DOMContentLoaded', function () {
     var t = ev.target;
     var i = rowIndexOf(t);
     if (i < 0) return;
-    if (t.classList.contains('f-onset')) {
+    if (t.classList.contains('f-breaks')) {
+      var mc = current && current.mapping ? current.mapping.maxChars : 0;
+      var rv = reflowBreaks(t.value, mc);
+      if (rv !== t.value) {
+        state[i].breaks = rv;
+        state[i]._forced = true;
+        renderAll();
+        return;
+      }
+      state[i].breaks = t.value;
+      refreshChanges();
+    } else if (t.classList.contains('f-sp')) {
+      state[i].sp = t.value; refreshChanges();
+    } else if (t.classList.contains('f-onset')) {
       var v = clampFrame(t.value);
       if (v === null) { t.value = state[i].onset; return; }
       applyOnset(i, v);
@@ -451,13 +633,19 @@ document.addEventListener('DOMContentLoaded', function () {
   init();
 });
 
-/* ============ 差分の計算 ============ */
+/* ============ 差分の計算 ============
+   orig は uid で引く。n は常に現在位置（表示番号）で付け直す。
+   新規行（orig に無い uid）は差分には入れない（構成変更として全行形式で送る）。 */
 function computeChanges() {
   var changes = [];
   state.forEach(function (s, i) {
-    var o = orig[i];
-    var c = { n: s.n };
+    var o = origByUid[s.uid];
+    s._isNew = !o;
+    if (!o) { s._changed = true; s._fields = []; return; }
+    var c = { n: i + 1 };
     var fields = [];
+    if (s.sp !== o.sp) { c.sp = s.sp; fields.push('sp'); }
+    if (s.text !== o.text) { c.text = s.text; fields.push('text'); }
     if (s.breaks !== o.breaks) { c.breaks = s.breaks; fields.push('breaks'); }
     if (s.slide !== o.slide) {
       c.slide = s.slide; fields.push('slide');
@@ -478,30 +666,72 @@ function computeChanges() {
   return changes;
 }
 
+/* 行構成が変わったか（uid の並びが読み込み時と異なるか）。 */
+function isStructureChanged() {
+  if (state.length !== origSeq.length) return true;
+  for (var i = 0; i < state.length; i++) {
+    if (state[i].uid !== origSeq[i]) return true;
+  }
+  return false;
+}
+
+/* 構成変更時に送る全行（n は現在位置で付け直す）。 */
+function buildFullLines() {
+  return state.map(function (s, i) {
+    var o = {
+      n: i + 1,
+      sp: s.sp,
+      text: s.text,
+      breaks: s.breaks,
+      slide: s.slide
+    };
+    if (s.slide === 'NEW') o.create = s.create || '';
+    o.expr_z = s.expr_z;
+    o.expr_m = s.expr_m;
+    o.onset = s.onset;
+    o.offset = s.offset;
+    o.se = s.seId ? { id: s.seId, frame: s.seFrame } : null;
+    o.note = s.note;
+    return o;
+  });
+}
+
 function buildRequest() {
-  return {
-    version: 1,
+  var req = {
+    version: 2,
     episode: (current && current.mapping.episode) || '',
-    savedAt: new Date().toISOString(),
-    changes: computeChanges()
+    savedAt: new Date().toISOString()
   };
+  if (isStructureChanged()) {
+    req.structure_changed = true;
+    req.lines = buildFullLines();
+  } else {
+    req.changes = computeChanges();
+  }
+  return req;
 }
 
 function refreshChanges() {
   if (!current) return;
+  computeChanges(); // 行ごとの _changed / _fields / _isNew を更新する
   var req = buildRequest();
-  $('changeCount').textContent = req.changes.length;
+  $('changeSummary').textContent = req.structure_changed
+    ? '構成変更（全' + state.length + '行）'
+    : '変更: ' + req.changes.length + ' 行';
   $('jsonPreview').textContent = JSON.stringify(req, null, 2);
   var rows = $('rows').children;
   for (var i = 0; i < rows.length && i < state.length; i++) {
     var s = state[i];
-    rows[i].classList.toggle('changed', !!s._changed);
+    var marked = !!(s._isNew || s._changed);
+    rows[i].classList.toggle('changed', marked);
     var badge = rows[i].querySelector('.chg');
     if (badge) {
-      badge.hidden = !s._changed;
-      badge.textContent = s._changed
-        ? '変更: ' + s._fields.map(function (f) { return FIELD_LABEL[f] || f; }).join('・')
-        : '';
+      badge.hidden = !marked;
+      badge.textContent = s._isNew
+        ? '新規行'
+        : (s._changed
+          ? '変更: ' + s._fields.map(function (f) { return FIELD_LABEL[f] || f; }).join('・')
+          : '');
     }
   }
 }
@@ -510,7 +740,7 @@ function refreshChanges() {
 function onSave() {
   if (!current) return;
   var req = buildRequest();
-  if (!req.changes.length) {
+  if (!req.structure_changed && !req.changes.length) {
     setStatus('saveStatus', '変更がありません', false);
     return;
   }

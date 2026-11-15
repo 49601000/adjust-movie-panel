@@ -10,6 +10,8 @@
 
 var MAPPING_NAME = 'adjust_mapping.json';
 var REQUEST_NAME = 'adjust_request.json';
+var SHARED_FOLDER_NAME = '調整パネル_shared-assets';
+var SE_EXTENSIONS = { mp3: true, wav: true, m4a: true };
 
 /** ウェブアプリの入口。Index.html を返す。 */
 function doGet() {
@@ -115,6 +117,65 @@ function getStillDataUrl(fileId) {
   } catch (e) {
     return { ok: false, error: errMsg_(e) };
   }
+}
+
+/**
+ * 共用カタログ（全プロジェクト共通の表情セット・SE 一覧）を返す。
+ * Drive フォルダ「調整パネル_shared-assets」の中身を走査する:
+ *   characters/zundamon/<セット名>/ → expr_z（サブフォルダ名）
+ *   characters/metan/<セット名>/    → expr_m（サブフォルダ名）
+ *   se/<ファイル>.mp3|wav|m4a       → se（拡張子を除いたファイル名が id/label）
+ * 成功時: { ok:true, expr_z:[...], expr_m:[...], se:[{id, label}] }
+ * 共用フォルダが無い場合: { ok:false, error:'shared folder not found' }
+ * サブフォルダが無い場合は空リスト（エラーにしない）。
+ */
+function getSharedCatalogs() {
+  try {
+    var it = DriveApp.getFoldersByName(SHARED_FOLDER_NAME);
+    if (!it.hasNext()) return { ok: false, error: 'shared folder not found' };
+    var root = it.next();
+    var characters = childFolder_(root, 'characters');
+    var zFolder = characters ? childFolder_(characters, 'zundamon') : null;
+    var mFolder = characters ? childFolder_(characters, 'metan') : null;
+    var seFolder = childFolder_(root, 'se');
+    var se = [];
+    if (seFolder) {
+      var files = seFolder.getFiles();
+      while (files.hasNext()) {
+        var name = files.next().getName();
+        var dot = name.lastIndexOf('.');
+        if (dot <= 0) continue;
+        var ext = name.substring(dot + 1).toLowerCase();
+        if (!SE_EXTENSIONS[ext]) continue;
+        var id = name.substring(0, dot);
+        se.push({ id: id, label: id });
+      }
+      se.sort(function (a, b) { return a.id < b.id ? -1 : (a.id > b.id ? 1 : 0); });
+    }
+    return {
+      ok: true,
+      expr_z: zFolder ? subfolderNames_(zFolder) : [],
+      expr_m: mFolder ? subfolderNames_(mFolder) : [],
+      se: se
+    };
+  } catch (e) {
+    return { ok: false, error: errMsg_(e) };
+  }
+}
+
+/** parent 直下のサブフォルダ name を返す（無ければ null）。 */
+function childFolder_(parent, name) {
+  var it = parent.getFoldersByName(name);
+  return it.hasNext() ? it.next() : null;
+}
+
+/** folder 直下のサブフォルダ名をソートして返す。 */
+function subfolderNames_(folder) {
+  var names = [];
+  var it = folder.getFolders();
+  while (it.hasNext()) names.push(it.next().getName());
+  names.sort();
+  return names;
 }
 
 function errMsg_(e) {
