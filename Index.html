@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<base target="_top">
+<title>調整パネル</title>
+<style>
+  body { font-family: sans-serif; margin: 16px; color: #222; background: #fafafa; }
+  h1 { font-size: 20px; margin: 0 0 8px; }
+  .help { font-size: 12px; color: #666; margin: 0 0 12px; }
+  .projbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+  .projbar select { min-width: 320px; max-width: 90vw; font-size: 14px; padding: 4px; }
+  button { font-size: 14px; padding: 5px 14px; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  .status { font-size: 13px; color: #555; }
+  .status.err { color: #c00; }
+  .epinfo { font-size: 13px; color: #444; margin: 6px 0 10px; }
+  .summary { position: sticky; top: 0; z-index: 5; display: flex; gap: 14px; align-items: center;
+             background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 8px 12px; margin-bottom: 10px; }
+  .summary b { font-size: 16px; }
+  details { margin-bottom: 12px; }
+  details pre { background: #f4f4f4; border: 1px solid #ddd; border-radius: 6px; padding: 10px;
+                font-size: 12px; max-height: 320px; overflow: auto; }
+  .row { display: flex; gap: 12px; background: #fff; border: 1px solid #ddd; border-radius: 8px;
+         padding: 10px; margin-bottom: 10px; }
+  .row.changed { border-color: #e8a13a; background: #fff8ec; box-shadow: inset 4px 0 #e8a13a; }
+  .still { flex: 0 0 240px; }
+  .still-img { width: 240px; height: auto; display: block; border-radius: 4px; background: #eee; }
+  .nostill { width: 240px; height: 135px; display: flex; align-items: center; justify-content: center;
+             background: #eee; color: #999; border-radius: 4px; font-size: 13px; }
+  .rbody { flex: 1; min-width: 0; }
+  .head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  .head .n { font-weight: bold; color: #888; }
+  .badge { padding: 1px 9px; border-radius: 10px; font-size: 12px; font-weight: bold; white-space: nowrap; }
+  .badge.z { background: #86D654; color: #173d05; }
+  .badge.m { background: #FF5CA3; color: #4d0f2c; }
+  .head .text { font-size: 15px; }
+  .chg { color: #b26a00; font-weight: bold; font-size: 12px; }
+  .controls { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+              gap: 8px 14px; margin-top: 10px; }
+  .controls label { font-size: 12px; color: #555; display: flex; flex-direction: column; gap: 3px; }
+  .controls .wide { grid-column: 1 / -1; }
+  .controls textarea, .controls input, .controls select { font-size: 14px; padding: 4px 6px; color: #222; }
+  .controls textarea { resize: vertical; }
+  @media (max-width: 720px) {
+    .row { flex-direction: column; }
+    .still { flex: none; }
+  }
+</style>
+</head>
+<body>
+  <h1>調整パネル</h1>
+  <p class="help">プロジェクト（話）を選んで読み込み、行ごとにスライド／表情／改行／SE／タイミングを調整してください。「修正依頼を保存」を押すと、Drive の同じフォルダに adjust_request.json（変更分のみ）が保存されます。</p>
+
+  <div class="projbar">
+    <select id="projectSelect"><option value="">読み込み中…</option></select>
+    <button id="loadBtn">読み込む</button>
+    <span id="projStatus" class="status"></span>
+  </div>
+  <div id="epInfo" class="epinfo"></div>
+
+  <div id="summaryBar" class="summary" hidden>
+    <span>変更: <b id="changeCount">0</b> 行</span>
+    <button id="saveBtn">修正依頼を保存（Drive）</button>
+    <span id="saveStatus" class="status"></span>
+  </div>
+
+  <details id="previewBox" hidden>
+    <summary>JSONプレビュー（保存される内容）</summary>
+    <pre id="jsonPreview"></pre>
+  </details>
+
+  <main id="rows"></main>
+
+<script>
+'use strict';
+
+/* ============ 状態 ============ */
+var projects = [];   // listProjects の結果
+var current = null;  // { folderId, folderName, mappingFileId, mapping, cats }
+var orig = [];       // 読み込んだ対応表の行（正規化済みスナップショット）
+var state = [];      // 現在の編集状態（orig と同じ形）
+var stillCache = {}; // still fileId -> data URL（フォールバック用）
+
+var FIELD_LABEL = {
+  breaks: '改行', slide: 'スライド', expr_z: '表情Z', expr_m: '表情M',
+  onset: 'onset', offset: 'offset', se: 'SE', note: 'メモ'
+};
+
+function $(id) { return document.getElementById(id); }
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+function toFrame(v) { var n = parseInt(v, 10); return isNaN(n) ? 0 : n; }
+function fmtTime(iso) {
+  if (!iso) return '';
+  var d = new Date(iso);
+  return isNaN(d.getTime()) ? String(iso) : d.toLocaleString('ja-JP');
+}
+function setStatus(id, msg, isErr) {
+  var el = $(id);
+  el.textContent = msg || '';
+  el.className = 'status' + (isErr ? ' err' : '');
+}
+
+/* ============ カタログ正規化 ============
+   slides / se は {id, label}、expr はセット名の文字列配列が基本。
+   どちらでも扱えるように {id, label} へ寄せる。 */
+function catList(cat) {
+  if (!Array.isArray(cat)) return [];
+  return cat.map(function (x) {
+    if (typeof x === 'string') return { id: x, label: x };
+    var id = x.id != null ? x.id : (x.name != null ? x.name : '');
+    return { id: String(id), label: String(x.label != null ? x.label : (x.name != null ? x.name : id)) };
+  });
+}
+
+/* 現在値がカタログに無い場合は落とさず「表に無い値」として残す */
+function optionsHtml(list, current) {
+  var html = '';
+  if (current === '') html += '<option value="" selected>（なし）</option>';
+  var found = list.some(function (o) { return String(o.id) === String(current); });
+  if (!found && current !== '') {
+    html += '<option value="' + esc(current) + '" selected>' + esc(current) + '（表に無い値）</option>';
+  }
+  list.forEach(function (o) {
+    html += '<option value="' + esc(o.id) + '"' +
+      (String(o.id) === String(current) ? ' selected' : '') + '>' + esc(o.label) + '</option>';
+  });
+  return html;
+}
+function slideOptionsHtml(list, current) {
+  var html = '';
+  if (current === '') html += '<option value="" selected>（なし）</option>';
+  var found = list.some(function (o) { return String(o.id) === String(current); });
+  if (!found && current !== '' && current !== 'NEW') {
+    html += '<option value="' + esc(current) + '" selected>' + esc(current) + '（表に無い値）</option>';
+  }
+  list.forEach(function (o) {
+    html += '<option value="' + esc(o.id) + '"' +
+      (String(o.id) === String(current) ? ' selected' : '') + '>' + esc(o.label) + '</option>';
+  });
+  html += '<option value="NEW"' + (current === 'NEW' ? ' selected' : '') + '>NEW（新規作成を依頼）</option>';
+  return html;
+}
+function seOptionsHtml(list, current) {
+  var html = '<option value=""' + (current === '' ? ' selected' : '') + '>なし</option>';
+  var found = list.some(function (o) { return String(o.id) === String(current); });
+  if (!found && current !== '') {
+    html += '<option value="' + esc(current) + '" selected>' + esc(current) + '（表に無い値）</option>';
+  }
+  list.forEach(function (o) {
+    html += '<option value="' + esc(o.id) + '"' +
+      (String(o.id) === String(current) ? ' selected' : '') + '>' + esc(o.label) + '</option>';
+  });
+  return html;
+}
+
+/* ============ 行の正規化 ============ */
+function normLine(l) {
+  l = l || {};
+  return {
+    n: l.n,
+    sp: l.sp || '',
+    text: l.text != null ? String(l.text) : '',
+    breaks: l.breaks != null ? String(l.breaks) : '',
+    slide: l.slide != null ? String(l.slide) : '',
+    create: '',
+    expr_z: l.expr_z != null ? String(l.expr_z) : '',
+    expr_m: l.expr_m != null ? String(l.expr_m) : '',
+    onset: toFrame(l.onset),
+    offset: toFrame(l.offset),
+    seId: (l.se && l.se.id != null) ? String(l.se.id) : '',
+    seFrame: l.se ? toFrame(l.se.frame) : toFrame(l.onset),
+    note: l.note != null ? String(l.note) : ''
+  };
+}
+
+/* ============ プロジェクト一覧 ============ */
+function init() {
+  $('loadBtn').addEventListener('click', onLoadProject);
+  $('saveBtn').addEventListener('click', onSave);
+  if (typeof google === 'undefined' || !google.script || !google.script.run) {
+    setStatus('projStatus', 'GAS 環境外では動作しません（デプロイしたウェブアプリから開いてください）', true);
+    return;
+  }
+  google.script.run
+    .withSuccessHandler(onProjects)
+    .withFailureHandler(function (e) {
+      setStatus('projStatus', '一覧の取得に失敗: ' + ((e && e.message) || e), true);
+    })
+    .listProjects();
+}
+
+function onProjects(res) {
+  var sel = $('projectSelect');
+  if (!Array.isArray(res)) {
+    sel.innerHTML = '<option value="">（取得失敗）</option>';
+    setStatus('projStatus', '一覧の取得に失敗: ' + (res && res.error ? res.error : '不明なエラー'), true);
+    return;
+  }
+  projects = res;
+  if (!projects.length) {
+    sel.innerHTML = '<option value="">（adjust_mapping.json が見つかりません）</option>';
+    setStatus('projStatus', 'プロジェクトがありません', false);
+    return;
+  }
+  sel.innerHTML = projects.map(function (p, i) {
+    var label = (p.episode || p.folderName || '(名称不明)') +
+      (p.format ? ' / ' + p.format : '') + ' / ' + fmtTime(p.modified);
+    return '<option value="' + i + '">' + esc(label) + '</option>';
+  }).join('');
+  setStatus('projStatus', projects.length + ' 件のプロジェクト', false);
+}
+
+/* ============ 対応表の読み込み ============ */
+function onLoadProject() {
+  var idx = $('projectSelect').value;
+  if (idx === '' || !projects[+idx]) return;
+  var p = projects[+idx];
+  setStatus('projStatus', '読み込み中…', false);
+  $('loadBtn').disabled = true;
+  google.script.run
+    .withSuccessHandler(function (m) {
+      $('loadBtn').disabled = false;
+      if (!m || m.ok === false || !Array.isArray(m.lines)) {
+        setStatus('projStatus', '対応表の読み込みに失敗: ' + (m && m.error ? m.error : '形式が不正です'), true);
+        return;
+      }
+      current = {
+        folderId: p.folderId,
+        folderName: p.folderName,
+        mappingFileId: p.mappingFileId,
+        mapping: m,
+        cats: {
+          slides: catList(m.catalogs && m.catalogs.slides),
+          expr_z: catList(m.catalogs && m.catalogs.expr_z),
+          expr_m: catList(m.catalogs && m.catalogs.expr_m),
+          se: catList(m.catalogs && m.catalogs.se)
+        }
+      };
+      orig = m.lines.map(normLine);
+      state = m.lines.map(normLine);
+      stillCache = {};
+      renderAll();
+      setStatus('projStatus', '読み込みました: ' + (m.episode || p.folderName), false);
+      setStatus('saveStatus', '', false);
+    })
+    .withFailureHandler(function (e) {
+      $('loadBtn').disabled = false;
+      setStatus('projStatus', '対応表の読み込みに失敗: ' + ((e && e.message) || e), true);
+    })
+    .loadMapping(p.mappingFileId);
+}
+
+/* ============ 描画 ============ */
+function stillHtml(rawLine) {
+  var fid = rawLine && rawLine.still ? String(rawLine.still) : '';
+  if (!fid) return '<div class="nostill">静止画なし</div>';
+  return '<img class="still-img" alt="プレビュー" loading="lazy" data-still="' + esc(fid) + '"' +
+    ' src="https://drive.google.com/thumbnail?id=' + encodeURIComponent(fid) + '&sz=w480"' +
+    ' onerror="onStillError(this)">';
+}
+
+/* サムネイルが読めなかったらサーバー経由の data URL にフォールバック */
+function onStillError(img) {
+  var fid = img.getAttribute('data-still');
+  if (!fid || img.getAttribute('data-fbk')) { img.style.display = 'none'; return; }
+  img.setAttribute('data-fbk', '1');
+  if (stillCache[fid]) { img.src = stillCache[fid]; return; }
+  google.script.run
+    .withSuccessHandler(function (url) {
+      if (typeof url === 'string' && url.indexOf('data:') === 0) {
+        stillCache[fid] = url;
+        var imgs = document.querySelectorAll('img[data-still="' + fid + '"]');
+        for (var i = 0; i < imgs.length; i++) imgs[i].src = url;
+      } else {
+        img.style.display = 'none';
+      }
+    })
+    .withFailureHandler(function () { img.style.display = 'none'; })
+    .getStillDataUrl(fid);
+}
+
+function renderAll() {
+  var m = current.mapping;
+  var info = [];
+  if (m.episode) info.push('話: ' + esc(m.episode));
+  if (m.format) info.push('形式: ' + esc(m.format));
+  if (m.fps) info.push('fps: ' + esc(m.fps));
+  if (m.size) info.push('サイズ: ' + esc(m.size));
+  if (current.folderName) info.push('フォルダ: ' + esc(current.folderName));
+  if (m.maxChars) info.push('改行は1行 最大' + esc(m.maxChars) + '文字');
+  $('epInfo').innerHTML = info.join('　');
+
+  var maxNote = m.maxChars ? '（1行 最大' + esc(m.maxChars) + '文字）' : '';
+  var html = '';
+  m.lines.forEach(function (raw, i) {
+    var s = state[i];
+    var badge = s.sp === 'Z'
+      ? '<span class="badge z">ずんだもん</span>'
+      : '<span class="badge m">めたん</span>';
+    html += '<div class="row" data-i="' + i + '" id="row' + i + '">' +
+      '<div class="still">' + stillHtml(raw) + '</div>' +
+      '<div class="rbody">' +
+        '<div class="head"><span class="n">#' + esc(s.n) + '</span>' + badge +
+          '<span class="text">' + esc(s.text) + '</span>' +
+          '<span class="chg" hidden></span></div>' +
+        '<div class="controls">' +
+          '<label class="wide">改行表示' + maxNote +
+            '<textarea class="f-breaks" rows="3">' + esc(s.breaks) + '</textarea></label>' +
+          '<label>スライド' +
+            '<select class="f-slide">' + slideOptionsHtml(current.cats.slides, s.slide) + '</select></label>' +
+          '<label class="f-create-wrap"' + (s.slide === 'NEW' ? '' : ' hidden') + '>新規スライドの作成指示' +
+            '<input type="text" class="f-create" placeholder="どんなスライドがほしいか" value="' + esc(s.create) + '"></label>' +
+          '<label>表情（ずんだもん）' +
+            '<select class="f-exprz">' + optionsHtml(current.cats.expr_z, s.expr_z) + '</select></label>' +
+          '<label>表情（めたん）' +
+            '<select class="f-exprm">' + optionsHtml(current.cats.expr_m, s.expr_m) + '</select></label>' +
+          '<label>オンセット (onset)' +
+            '<input type="number" class="f-onset" min="0" step="1" value="' + s.onset + '"></label>' +
+          '<label>オフセット (offset)' +
+            '<input type="number" class="f-offset" min="0" step="1" value="' + s.offset + '"></label>' +
+          '<label>SE' +
+            '<select class="f-se">' + seOptionsHtml(current.cats.se, s.seId) + '</select></label>' +
+          '<label>SEフレーム' +
+            '<input type="number" class="f-seframe" min="0" step="1" value="' + s.seFrame + '"' +
+              (s.seId ? '' : ' disabled') + '></label>' +
+          '<label class="wide">伝言メモ' +
+            '<input type="text" class="f-note" placeholder="めたまるへの伝言（任意）" value="' + esc(s.note) + '"></label>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
+  });
+  $('rows').innerHTML = html;
+  $('summaryBar').hidden = false;
+  $('previewBox').hidden = false;
+  refreshChanges();
+}
+
+/* ============ タイミングのカスケード ============
+   onset を d 動かす: その行の offset も d 動き、後続行は onset/offset ともに d 動く。
+   offset を d 動かす: 後続行の onset/offset が d 動く（その行の onset は不変）。
+   行の onset が動いたら、その行の SE フレームも一緒に動かす（相対位置を保つ）。 */
+function shiftLater_(fromIdx, d) {
+  for (var j = fromIdx; j < state.length; j++) {
+    state[j].onset += d;
+    state[j].offset += d;
+    if (state[j].seId) state[j].seFrame += d;
+  }
+}
+function applyOnset(i, newVal) {
+  var d = newVal - state[i].onset;
+  if (!d) return;
+  state[i].onset = newVal;
+  state[i].offset += d;
+  if (state[i].seId) state[i].seFrame += d;
+  shiftLater_(i + 1, d);
+  syncFrameInputs();
+}
+function applyOffset(i, newVal) {
+  var d = newVal - state[i].offset;
+  if (!d) return;
+  state[i].offset = newVal;
+  shiftLater_(i + 1, d);
+  syncFrameInputs();
+}
+function syncFrameInputs() {
+  var rows = $('rows').children;
+  for (var i = 0; i < rows.length && i < state.length; i++) {
+    rows[i].querySelector('.f-onset').value = state[i].onset;
+    rows[i].querySelector('.f-offset').value = state[i].offset;
+    rows[i].querySelector('.f-seframe').value = state[i].seFrame;
+  }
+}
+function clampFrame(v) {
+  var n = parseInt(v, 10);
+  if (isNaN(n)) return null;
+  return Math.max(0, n);
+}
+
+/* ============ 入力イベント（委譲） ============ */
+function rowIndexOf(el) {
+  var row = el;
+  while (row && !(row.classList && row.classList.contains('row'))) row = row.parentNode;
+  return row ? +row.getAttribute('data-i') : -1;
+}
+
+document.addEventListener('DOMContentLoaded', function () {
+  var rowsEl = $('rows');
+
+  rowsEl.addEventListener('input', function (ev) {
+    var t = ev.target;
+    var i = rowIndexOf(t);
+    if (i < 0) return;
+    if (t.classList.contains('f-breaks')) { state[i].breaks = t.value; refreshChanges(); }
+    else if (t.classList.contains('f-create')) { state[i].create = t.value; refreshChanges(); }
+    else if (t.classList.contains('f-note')) { state[i].note = t.value; refreshChanges(); }
+  });
+
+  rowsEl.addEventListener('change', function (ev) {
+    var t = ev.target;
+    var i = rowIndexOf(t);
+    if (i < 0) return;
+    if (t.classList.contains('f-onset')) {
+      var v = clampFrame(t.value);
+      if (v === null) { t.value = state[i].onset; return; }
+      applyOnset(i, v);
+      refreshChanges();
+    } else if (t.classList.contains('f-offset')) {
+      var v2 = clampFrame(t.value);
+      if (v2 === null) { t.value = state[i].offset; return; }
+      applyOffset(i, v2);
+      refreshChanges();
+    } else if (t.classList.contains('f-slide')) {
+      state[i].slide = t.value;
+      // label の親（.controls）から作成指示欄を探す
+      var controls = t.parentNode.parentNode;
+      var cw = controls ? controls.querySelector('.f-create-wrap') : null;
+      if (cw) {
+        cw.hidden = t.value !== 'NEW';
+        if (t.value === 'NEW') {
+          var ci = cw.querySelector('.f-create');
+          if (ci) ci.focus();
+        }
+      }
+      refreshChanges();
+    } else if (t.classList.contains('f-exprz')) {
+      state[i].expr_z = t.value; refreshChanges();
+    } else if (t.classList.contains('f-exprm')) {
+      state[i].expr_m = t.value; refreshChanges();
+    } else if (t.classList.contains('f-se')) {
+      var had = !!state[i].seId;
+      state[i].seId = t.value;
+      if (t.value && !had) state[i].seFrame = state[i].onset; // 既定は行の onset
+      var row = t;
+      while (row && !(row.classList && row.classList.contains('row'))) row = row.parentNode;
+      var fi = row ? row.querySelector('.f-seframe') : null;
+      if (fi) { fi.disabled = !t.value; fi.value = state[i].seFrame; }
+      refreshChanges();
+    } else if (t.classList.contains('f-seframe')) {
+      var v3 = clampFrame(t.value);
+      if (v3 === null) { t.value = state[i].seFrame; return; }
+      state[i].seFrame = v3;
+      refreshChanges();
+    }
+  });
+
+  init();
+});
+
+/* ============ 差分の計算 ============ */
+function computeChanges() {
+  var changes = [];
+  state.forEach(function (s, i) {
+    var o = orig[i];
+    var c = { n: s.n };
+    var fields = [];
+    if (s.breaks !== o.breaks) { c.breaks = s.breaks; fields.push('breaks'); }
+    if (s.slide !== o.slide) {
+      c.slide = s.slide; fields.push('slide');
+      if (s.slide === 'NEW') c.create = s.create || '';
+    }
+    if (s.expr_z !== o.expr_z) { c.expr_z = s.expr_z; fields.push('expr_z'); }
+    if (s.expr_m !== o.expr_m) { c.expr_m = s.expr_m; fields.push('expr_m'); }
+    if (s.onset !== o.onset) { c.onset = s.onset; fields.push('onset'); }
+    if (s.offset !== o.offset) { c.offset = s.offset; fields.push('offset'); }
+    var curSe = s.seId ? { id: s.seId, frame: s.seFrame } : null;
+    var orgSe = o.seId ? { id: o.seId, frame: o.seFrame } : null;
+    if (JSON.stringify(curSe) !== JSON.stringify(orgSe)) { c.se = curSe; fields.push('se'); }
+    if (s.note !== o.note) { c.note = s.note; fields.push('note'); }
+    s._changed = fields.length > 0;
+    s._fields = fields;
+    if (s._changed) changes.push(c);
+  });
+  return changes;
+}
+
+function buildRequest() {
+  return {
+    version: 1,
+    episode: (current && current.mapping.episode) || '',
+    savedAt: new Date().toISOString(),
+    changes: computeChanges()
+  };
+}
+
+function refreshChanges() {
+  if (!current) return;
+  var req = buildRequest();
+  $('changeCount').textContent = req.changes.length;
+  $('jsonPreview').textContent = JSON.stringify(req, null, 2);
+  var rows = $('rows').children;
+  for (var i = 0; i < rows.length && i < state.length; i++) {
+    var s = state[i];
+    rows[i].classList.toggle('changed', !!s._changed);
+    var badge = rows[i].querySelector('.chg');
+    if (badge) {
+      badge.hidden = !s._changed;
+      badge.textContent = s._changed
+        ? '変更: ' + s._fields.map(function (f) { return FIELD_LABEL[f] || f; }).join('・')
+        : '';
+    }
+  }
+}
+
+/* ============ 保存 ============ */
+function onSave() {
+  if (!current) return;
+  var req = buildRequest();
+  if (!req.changes.length) {
+    setStatus('saveStatus', '変更がありません', false);
+    return;
+  }
+  if (!current.folderId) {
+    setStatus('saveStatus', '保存先フォルダが特定できませんでした', true);
+    return;
+  }
+  setStatus('saveStatus', '保存中…', false);
+  $('saveBtn').disabled = true;
+  google.script.run
+    .withSuccessHandler(function (res) {
+      $('saveBtn').disabled = false;
+      if (res && res.ok) {
+        setStatus('saveStatus', '保存しました（' + fmtTime(res.modified) + '）', false);
+      } else {
+        setStatus('saveStatus', '保存に失敗: ' + (res && res.error ? res.error : '不明なエラー'), true);
+      }
+    })
+    .withFailureHandler(function (e) {
+      $('saveBtn').disabled = false;
+      setStatus('saveStatus', '保存に失敗: ' + ((e && e.message) || e), true);
+    })
+    .saveRequest(current.folderId, req);
+}
+</script>
+</body>
+</html>
