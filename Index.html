@@ -43,6 +43,7 @@
   .controls .wide { grid-column: 1 / -1; }
   .controls textarea, .controls input, .controls select { font-size: 14px; padding: 4px 6px; color: #222; }
   .controls textarea { resize: vertical; }
+  .f-slidespan { font-size: 11px; color: #777; }
   @media (max-width: 720px) {
     .row { flex-direction: column; }
     .still { flex: none; }
@@ -51,7 +52,7 @@
 </head>
 <body>
   <h1>調整パネル</h1>
-  <p class="help">プロジェクト（話）を選んで読み込み、行ごとにセリフ／スライド／表情／改行／SE／タイミングを調整してください。行の分割・追加・削除もできます。「修正依頼を保存」を押すと、Drive の同じフォルダに adjust_request.json が保存されます（通常は変更分のみ、行構成を変えた場合は全行）。<span id="saveDest"></span> 共用アセットの置き場: <a href="https://drive.google.com/drive/folders/1oMc447xUEsA15rPLmABwzvCm0Inu_Kme" target="_blank" rel="noopener">調整パネル_shared-assets</a></p>
+  <p class="help">プロジェクト（話）を選んで読み込み、行ごとにセリフ／スライド／表情／改行／SE／タイミングを調整してください。行の分割・追加・削除もできます。各行のスライド欄には、そのスライドの表示区間（先頭行の onset ～ 末尾行の offset）が表示され、タイミングの編集に連動します（区間自体は編集できません）。「修正依頼を保存」を押すと、Drive の同じフォルダに adjust_request.json が保存されます（通常は変更分のみ、行構成を変えた場合は全行）。<span id="saveDest"></span> 共用アセットの置き場: <a href="https://drive.google.com/drive/folders/1oMc447xUEsA15rPLmABwzvCm0Inu_Kme" target="_blank" rel="noopener">調整パネル_shared-assets</a></p>
 
   <div class="projbar">
     <select id="projectSelect"><option value="">読み込み中…</option></select>
@@ -395,6 +396,7 @@ function renderAll() {
   }
 
   var maxNote = m.maxChars ? '（1行 最大' + esc(m.maxChars) + '文字）' : '';
+  var spans = computeSlideSpans();
   var html = '';
   state.forEach(function (s, i) {
     html += '<div class="row" data-i="' + i + '" id="row' + i + '">' +
@@ -414,7 +416,8 @@ function renderAll() {
             (s._forced ? ' <span style="color:#c00;font-weight:bold">⚠ ' + esc(m.maxChars) + '文字で強制改行</span>' : '') +
             '<textarea class="f-breaks" rows="3">' + esc(s.breaks) + '</textarea></label>' +
           '<label>スライド' +
-            '<select class="f-slide">' + slideOptionsHtml(current.cats.slides, s.slide) + '</select></label>' +
+            '<select class="f-slide">' + slideOptionsHtml(current.cats.slides, s.slide) + '</select>' +
+            '<span class="f-slidespan">' + esc(slideSpanText(s, spans[i])) + '</span></label>' +
           '<label class="f-create-wrap"' + (s.slide === 'NEW' ? '' : ' hidden') + '>新規スライドの作成指示' +
             '<input type="text" class="f-create" placeholder="どんなスライドがほしいか" value="' + esc(s.create) + '"></label>' +
           '<label>表情（ずんだもん）' +
@@ -481,6 +484,35 @@ function clampFrame(v) {
   var n = parseInt(v, 10);
   if (isNaN(n)) return null;
   return Math.max(0, n);
+}
+
+/* ============ スライド区間（表示のみ） ============
+   同じ slide id が連続する最大のまとまりを1ブロックとし、
+   区間の onset = ブロック先頭行の onset、offset = ブロック末尾行の offset。
+   state から毎回導出するので、onset/offset のカスケード編集・スライドの
+   付け替え・行の分割/追加/削除にそのまま追随する。
+   表示専用であり、修正依頼 JSON には一切含めない。 */
+function computeSlideSpans() {
+  var spans = [];
+  var i = 0;
+  while (i < state.length) {
+    var j = i;
+    while (j + 1 < state.length && state[j + 1].slide === state[i].slide) j++;
+    for (var k = i; k <= j; k++) {
+      spans[k] = { onset: state[i].onset, offset: state[j].offset };
+    }
+    i = j + 1;
+  }
+  return spans;
+}
+function slideSpanText(s, span) {
+  if (!s.slide || !span) return 'スライド区間 —';
+  var fps = current && current.mapping ? parseFloat(current.mapping.fps) : 0;
+  var t = 'スライド区間 ' + span.onset + '–' + span.offset + 'f';
+  if (fps > 0) {
+    t += '（' + (span.onset / fps).toFixed(1) + '–' + (span.offset / fps).toFixed(1) + '秒）';
+  }
+  return t;
 }
 
 /* ============ 行の構成操作（分割・追加・削除） ============
@@ -720,6 +752,7 @@ function buildRequest() {
 function refreshChanges() {
   if (!current) return;
   computeChanges(); // 行ごとの _changed / _fields / _isNew を更新する
+  var spans = computeSlideSpans(); // スライド区間表示の連動用（毎回 state から導出）
   var req = buildRequest();
   $('changeSummary').textContent = req.structure_changed
     ? '構成変更（全' + state.length + '行）'
@@ -739,6 +772,8 @@ function refreshChanges() {
           ? '変更: ' + s._fields.map(function (f) { return FIELD_LABEL[f] || f; }).join('・')
           : '');
     }
+    var spEl = rows[i].querySelector('.f-slidespan');
+    if (spEl) spEl.textContent = slideSpanText(s, spans[i]);
   }
 }
 
